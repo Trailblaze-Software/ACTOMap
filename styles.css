@@ -278,11 +278,12 @@ body {
   margin-bottom: 2px;
 }
 
+/* Direct child of body: must not sit under .map-wrap (overflow:hidden) or Leaflet sees ~0 size. */
 .export-stage {
   position: fixed;
-  left: -9999px;
+  left: -10000px;
   top: 0;
-  overflow: hidden;
+  overflow: visible;
   pointer-events: none;
   opacity: 0;
   z-index: -1;

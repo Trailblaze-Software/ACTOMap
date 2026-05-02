@@ -18,15 +18,98 @@
   /**
    * Max longest edge of the rasterised bitmap (avoids canvas limits; typical ~8k–16k).
    * The off-screen map can be larger; scale is reduced so output stays within this.
+   * Keep ≥ EXPORT_MAP_MAX_LONG_EDGE_PX so +1 zoom (2× map) is not downsampled at rasterise.
    */
-  const EXPORT_CAPTURE_MAX_EDGE_PX = 12288;
+  const EXPORT_CAPTURE_MAX_EDGE_PX = 16384;
 
   /**
-   * Enlarges the off-screen export map (same geographic bounds). Leaflet’s fit zoom increases
-   * (~log2 of this factor), so tiles use smaller cartographic type. Can be large because capture
-   * scale is lowered automatically (see EXPORT_CAPTURE_MAX_EDGE_PX).
+   * Target multiplier for off-screen map width/height vs paper×DPI (higher → higher Leaflet zoom).
+   * Very large values (e.g. 16 → ~40k px edges) freeze the tab: thousands of tiles and brutal layout.
+   * Effective scale is also capped by EXPORT_MAP_MAX_LONG_EDGE_PX.
    */
-  const EXPORT_FIT_ZOOM_PIXEL_SCALE = 12;
+  const EXPORT_FIT_ZOOM_PIXEL_SCALE = 4;
+
+  /**
+   * Hard limit on max(width,height) of the print map in CSS pixels (layout + tile count).
+   * `fitPxScale` uses the full ratio up to this cap (not floored). Raised so EXPORT_PDF_EXTRA_ZOOM_LEVELS
+   * can double size (~+1 Leaflet zoom for the same bounds) without always hitting this ceiling.
+   */
+  const EXPORT_MAP_MAX_LONG_EDGE_PX = 16384;
+
+  /**
+   * Extra whole Leaflet zoom levels for the same export bounds: width/height are multiplied by 2^n after
+   * fitPxScale (Web Mercator: ~one zoom level ≈ double pixels per axis for the same geographic span).
+   */
+  const EXPORT_PDF_EXTRA_ZOOM_LEVELS = 1;
+
+  /**
+   * jsPDF re-decodes raster data for PNG; very large bitmaps throw RangeError (Invalid array length).
+   * Final map image is scaled down to fit this longest edge before embedding (georef uses page mm + GPTS).
+   */
+  const EXPORT_JSPDF_MAX_IMAGE_LONG_EDGE_PX = 4096;
+
+  /** Quality for JPEG map image in PDF (after optional downscale). */
+  const EXPORT_PDF_JPEG_QUALITY = 0.93;
+
+  /**
+   * PDF export only: load tiles this many zoom levels **coarser** than the fitted map zoom.
+   * Leaflet upscales them → far fewer tile requests (≈4× fewer per step in each axis).
+   * Labels look larger/softer; increase fit pixel scale or reduce this if type is too fuzzy.
+   */
+  const EXPORT_PDF_TILE_LEVELS_COARSER = 3;
+
+  /**
+   * Fixed Leaflet zoom per scale denominator (the `1 : scaleDen` from the export form).
+   * Tune from your tile pyramid / labelling (not replaced by tooling). If a value is **lower** than
+   * the zoom needed to fill the orange extent on the print map, code may **raise** zoom unless
+   * EXPORT_PDF_ZOOM_TABLE_STRICT — see that flag.
+   * Fractional zoom allowed (`zoomSnap: 0`). `{}` = always fitBounds.
+   */
+  const EXPORT_PDF_ZOOM_BY_SCALE_DEN = {
+    5000: 18,
+    10000: 17,
+    15000: 16,
+    25000: 15,
+    50000: 14,
+    100000: 13,
+    250000: 12,
+  };
+
+  /**
+   * If false: may **raise** table zoom to `getBoundsZoom(export bounds)` so the orange extent fills the
+   * print map (good when the table was only a rough guess). If true: use the table zoom exactly —
+   * needed when values are set from **tile pyramid / label scale** (e.g. z15 for 1:25k) even if that
+   * letterboxes on the large export canvas; crop-to-bounds still trims the PDF to the orange extent.
+   */
+  const EXPORT_PDF_ZOOM_TABLE_STRICT = true;
+
+  /**
+   * @param {number} scaleDen
+   * @returns {number | null}
+   */
+  function pdfZoomFromScaleDenTable(scaleDen) {
+    if (!EXPORT_PDF_ZOOM_BY_SCALE_DEN || typeof EXPORT_PDF_ZOOM_BY_SCALE_DEN !== "object") return null;
+    if (!Object.prototype.hasOwnProperty.call(EXPORT_PDF_ZOOM_BY_SCALE_DEN, scaleDen)) return null;
+    const z = Number(EXPORT_PDF_ZOOM_BY_SCALE_DEN[scaleDen]);
+    return Number.isFinite(z) ? z : null;
+  }
+
+  /**
+   * @param {L.Map} leafletMap
+   * @param {L.LatLngBounds} b
+   * @param {number} [marginPx]
+   * @returns {boolean}
+   */
+  function exportBoundsFullyInMapViewport(leafletMap, b, marginPx) {
+    const m = marginPx === undefined ? 0 : marginPx;
+    const sz = leafletMap.getSize();
+    const corners = [b.getNorthWest(), b.getNorthEast(), b.getSouthEast(), b.getSouthWest()];
+    for (let i = 0; i < corners.length; i++) {
+      const p = leafletMap.latLngToContainerPoint(corners[i]);
+      if (p.x < -m || p.y < -m || p.x > sz.x + m || p.y > sz.y + m) return false;
+    }
+    return true;
+  }
 
   function initProjUtm55() {
     const p4 = window.proj4;
@@ -132,12 +215,20 @@
    * GDAL gdal2tiles without `--xyz` uses TMS — open the app with `?tms=1` or set
    * `tms: true` below. Wrong Y order still fetches PNGs (200) but the map looks
    * empty or like random specks.
+   *
+   * PDF export draws tiles to a canvas → needs CORS: tile responses must include
+   * `Access-Control-Allow-Origin` (e.g. `*` or your app origin). `crossOrigin: true` on the layer
+   * requests anonymous CORS; without the header, `toDataURL` throws “tainted canvas”.
    */
   const TILE_CONFIG = {
     url: "http://localhost:8765/{z}/{x}/{y}.png",
     tms: false,
     minZoom: 0,
     maxZoom: 17,
+  };
+
+  const TILE_LAYER_OPTIONS = {
+    crossOrigin: true,
   };
 
   const PAPER_MM = {
@@ -193,7 +284,7 @@
     const paper = paperEl && paperEl.value ? paperEl.value : "A4";
     const orient = orientEl && orientEl.value ? orientEl.value : "portrait";
     const scaleEl = document.getElementById("scale-den");
-    const scaleDen = scaleEl ? Number(scaleEl.value) : 50000;
+    const scaleDen = scaleEl ? Number(scaleEl.value) : 25000;
     const dpi = EXPORT_RASTER_DPI;
     const magEl = document.getElementById("pdf-magnetic-north");
     const magneticNorthUp = !!(magEl && magEl.checked);
@@ -232,6 +323,7 @@
       maxZoom,
       tms,
       attribution: "Tiles",
+      ...TILE_LAYER_OPTIONS,
     });
 
     tileLayer.on("tileerror", function (ev) {
@@ -358,42 +450,155 @@
    * @param {() => void} done
    * @param {number} maxWaitMs
    */
-  function waitForTiles(leafletMap, activeLayer, done, maxWaitMs) {
-    const start = performance.now();
-    if (!activeLayer) {
+  /**
+   * Registers `load` before `addTo` so fast/cached tiles don’t miss the event.
+   * Always ends by maxWaitMs so export never hangs indefinitely.
+   */
+  function waitForTileLayerReady(leafletMap, layer, done, maxWaitMs) {
+    if (!layer) {
+      pdfExportLog("tiles: no layer, skip wait");
       done();
       return;
     }
-
-    function pending() {
-      const el = leafletMap.getContainer();
-      const tiles = el.querySelectorAll(".leaflet-tile");
-      let loading = 0;
-      tiles.forEach(function (img) {
-        if (!img.complete) loading += 1;
-      });
-      return loading;
+    let settled = false;
+    function finish(reason) {
+      if (settled) return;
+      settled = true;
+      pdfExportLog("tiles: done — " + reason);
+      done();
     }
-
-    function tick() {
-      if (pending() === 0 || performance.now() - start > maxWaitMs) {
-        done();
-        return;
-      }
-      requestAnimationFrame(tick);
-    }
-
-    activeLayer.on("load", function once() {
-      activeLayer.off("load", once);
-      setTimeout(tick, 80);
+    const hardStop = window.setTimeout(function () {
+      finish("timeout after " + maxWaitMs + "ms (check tile server / network)");
+    }, maxWaitMs);
+    layer.once("load", function () {
+      window.clearTimeout(hardStop);
+      finish("Leaflet tile layer load event");
     });
-
-    setTimeout(tick, 50);
+    pdfExportLog("tiles: layer.addTo(printMap) …");
+    layer.addTo(leafletMap);
   }
 
   function setExportStatus(text) {
     const el = document.getElementById("export-status");
     if (el) el.textContent = text;
+  }
+
+  /** Leaflet can throw on remove if the container is already torn down; don’t fail the export. */
+  function safeRemoveExportMap(m) {
+    if (!m) return;
+    try {
+      m.remove();
+    } catch (e) {
+      console.warn("[actomap PDF] map.remove()", e);
+    }
+  }
+
+  /** Always use plain console.log so messages show even if “group” logging is collapsed. */
+  function pdfExportLog(step, detail) {
+    const t = typeof performance !== "undefined" && performance.now ? performance.now().toFixed(0) : "?";
+    if (detail !== undefined) {
+      console.log("[actomap PDF +" + t + "ms] " + step, detail);
+    } else {
+      console.log("[actomap PDF +" + t + "ms] " + step);
+    }
+  }
+
+  /** UMD vs ESM global */
+  function getHtml2CanvasFn() {
+    const g = window.html2canvas;
+    if (typeof g === "function") return g;
+    if (g && typeof g.default === "function") return g.default;
+    return null;
+  }
+
+  /**
+   * Axis-aligned bbox in map-container pixels for the four corners of `bounds`.
+   * `fitBounds` often letterboxes (visible getBounds() ⊃ bounds); cropping to this rect matches the orange export extent.
+   *
+   * @param {L.Map} leafletMap
+   * @param {L.LatLngBounds} b
+   * @returns {{ minX: number; minY: number; maxX: number; maxY: number; w: number; h: number }}
+   */
+  function exportBoundsContainerPxAabb(leafletMap, b) {
+    const corners = [b.getNorthWest(), b.getNorthEast(), b.getSouthEast(), b.getSouthWest()];
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    for (let i = 0; i < corners.length; i++) {
+      const p = leafletMap.latLngToContainerPoint(corners[i]);
+      if (p.x < minX) minX = p.x;
+      if (p.x > maxX) maxX = p.x;
+      if (p.y < minY) minY = p.y;
+      if (p.y > maxY) maxY = p.y;
+    }
+    return { minX: minX, minY: minY, maxX: maxX, maxY: maxY, w: maxX - minX, h: maxY - minY };
+  }
+
+  /**
+   * @param {HTMLCanvasElement} src
+   * @param {number} maxLongEdge
+   * @returns {HTMLCanvasElement}
+   */
+  function clampCanvasLongEdgeForJsPdf(src, maxLongEdge) {
+    const w = src.width;
+    const h = src.height;
+    const long = Math.max(w, h);
+    if (long <= maxLongEdge) return src;
+    const s = maxLongEdge / long;
+    const tw = Math.max(1, Math.round(w * s));
+    const th = Math.max(1, Math.round(h * s));
+    const out = document.createElement("canvas");
+    out.width = tw;
+    out.height = th;
+    const ctx = out.getContext("2d");
+    if (!ctx) return src;
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = "high";
+    ctx.drawImage(src, 0, 0, tw, th);
+    console.log("[actomap PDF export] scaled for jsPDF embed", w, "×", h, "→", tw, "×", th);
+    return out;
+  }
+
+  /**
+   * Paint loaded `.leaflet-tile` images into a canvas (same tiles Leaflet already decoded — no iframe clone).
+   * Only for layouts without CSS rotation on the tile pane; rotated magnetic exports still use html2canvas.
+   *
+   * @param {HTMLElement} rootEl
+   * @param {number} widthPx
+   * @param {number} heightPx
+   * @param {number} pixelScale
+   * @returns {HTMLCanvasElement}
+   */
+  function rasterizeLeafletTilesFromElement(rootEl, widthPx, heightPx, pixelScale) {
+    const cw = Math.max(1, Math.round(widthPx * pixelScale));
+    const ch = Math.max(1, Math.round(heightPx * pixelScale));
+    const canvas = document.createElement("canvas");
+    canvas.width = cw;
+    canvas.height = ch;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return canvas;
+    ctx.fillStyle = "#1c2430";
+    ctx.fillRect(0, 0, cw, ch);
+    const rootRect = rootEl.getBoundingClientRect();
+    let drawn = 0;
+    rootEl.querySelectorAll("img.leaflet-tile").forEach(function (img) {
+      if (!img.complete || img.naturalWidth === 0) return;
+      const r = img.getBoundingClientRect();
+      const dx = (r.left - rootRect.left) * pixelScale;
+      const dy = (r.top - rootRect.top) * pixelScale;
+      const dw = r.width * pixelScale;
+      const dh = r.height * pixelScale;
+      if (dw < 0.25 || dh < 0.25) return;
+      try {
+        ctx.drawImage(img, dx, dy, dw, dh);
+        drawn += 1;
+      } catch (err) {
+        console.warn("[actomap PDF] tile drawImage skipped", err);
+      }
+    });
+    console.log("[actomap PDF export] rasterizeLeafletTiles drew", drawn, "images →", canvas.width, "×", canvas.height);
+    return canvas;
   }
 
   /**
@@ -810,9 +1015,8 @@
     const { url, minZoom, maxZoom } = TILE_CONFIG;
     const tms = tileTmsFromConfig();
     const { paper, orient, scaleDen, dpi, magneticNorthUp } = readExportControls();
-    const h2c = window.html2canvas;
     const jsPdfMod = window.jspdf;
-    if (!map || !h2c || !jsPdfMod) {
+    if (!map || !jsPdfMod) {
       setExportStatus("PDF libraries failed to load.");
       return;
     }
@@ -829,14 +1033,56 @@
     const wPx = (widthMm / 25.4) * dpi;
     const WBase = Math.max(1, Math.round(wPx));
     const HBase = Math.max(1, Math.round((WBase * heightMm) / widthMm));
-    const fitPxScale = Math.max(1, EXPORT_FIT_ZOOM_PIXEL_SCALE);
-    const W = Math.max(1, Math.round(WBase * fitPxScale));
-    const H = Math.max(1, Math.round(HBase * fitPxScale));
+    const longestBase = Math.max(WBase, HBase);
+    const fitPxDesired = Math.max(1, EXPORT_FIT_ZOOM_PIXEL_SCALE);
+    const extraZoomLevels = Math.max(0, Math.floor(EXPORT_PDF_EXTRA_ZOOM_LEVELS));
+    const zoomMult = Math.pow(2, extraZoomLevels);
+    /** Leave 2^n headroom so W,H after ×zoomMult still fit EXPORT_MAP_MAX_LONG_EDGE_PX. */
+    const fitPxCap = Math.max(1, EXPORT_MAP_MAX_LONG_EDGE_PX / longestBase / zoomMult);
+    const fitPxScale = Math.min(fitPxDesired, fitPxCap);
+    /*
+     * One combined W×H from paper aspect (WBase:HBase). Rounding W and H in separate steps
+     * (e.g. round(base×scale) then ×2) skews aspect → fitBounds letterboxes differently → wrong 1:scale.
+     */
+    const wIdeal = WBase * fitPxScale * zoomMult;
+    const hIdeal = HBase * fitPxScale * zoomMult;
+    const longIdeal = Math.max(wIdeal, hIdeal);
+    const mapCap = EXPORT_MAP_MAX_LONG_EDGE_PX;
+    const fitShrink = longIdeal > mapCap ? mapCap / longIdeal : 1;
+    let W = Math.max(1, Math.round(wIdeal * fitShrink));
+    let H = Math.max(1, Math.round((W * HBase) / WBase));
+    if (Math.max(W, H) > mapCap) {
+      if (H >= W) {
+        H = mapCap;
+        W = Math.max(1, Math.round((H * WBase) / HBase));
+      } else {
+        W = mapCap;
+        H = Math.max(1, Math.round((W * HBase) / WBase));
+      }
+    }
 
     setExportStatus("Preparing export…");
+    pdfExportLog("start exportPdf", {
+      WBase: WBase,
+      HBase: HBase,
+      W: W,
+      H: H,
+      fitPxDesired: fitPxDesired,
+      fitPxScale: fitPxScale,
+      capped: fitPxScale < fitPxDesired,
+      extraZoomLevels: extraZoomLevels,
+      mapLongEdge: Math.max(W, H),
+      mapFitShrink: fitShrink,
+    });
 
     const stage = document.getElementById("export-stage");
+    if (!stage) {
+      console.error("[actomap PDF] #export-stage not in DOM");
+      setExportStatus("Missing #export-stage — check index.html.");
+      return;
+    }
     stage.innerHTML = "";
+    pdfExportLog("stage cleared");
 
     const container = document.createElement("div");
     container.style.width = W + "px";
@@ -849,11 +1095,15 @@
     let declUsed = null;
 
     if (magneticNorthUp) {
+      pdfExportLog("magnetic: declination lookup…");
       const dec = magneticDeclinationDeg(center.lat, center.lng);
+      pdfExportLog("magnetic: declination", dec);
       if (dec === null) {
         setExportStatus("Magnetic model unavailable; PDF uses true north.");
+        pdfExportLog("append container (no rotation)…");
         stage.appendChild(container);
       } else if (Math.abs(dec) <= 0.001) {
+        pdfExportLog("append container (declination ~0)…");
         stage.appendChild(container);
         declUsed = dec;
       } else {
@@ -877,75 +1127,320 @@
           -dec +
           "deg);transform-origin:center center;";
         outer.appendChild(container);
+        pdfExportLog("append outer+rotated map (sync layout may pause here if W×H is large)…");
         stage.appendChild(outer);
         captureEl = outer;
         doCrop = true;
       }
     } else {
+      pdfExportLog("append map container (sync layout may pause here if W×H is large)…");
       stage.appendChild(container);
     }
 
     stage.style.width = outerW + "px";
     stage.style.height = outerH + "px";
-
-    const printMap = L.map(container, {
-      attributionControl: true,
-      zoomControl: false,
-      zoomSnap: 0,
-      zoomDelta: 0.05,
-      maxZoom: maxZoom,
+    pdfExportLog("stage sized + container in DOM", {
+      outerW: outerW,
+      outerH: outerH,
+      stageOffset: { w: stage.offsetWidth, h: stage.offsetHeight },
     });
 
-    printMap.fitBounds(bounds, { animate: false, padding: [0, 0] });
+    /**
+     * Leaflet fires map `load` / marks `_loaded` only after the first `setView` / `fitBounds`
+     * (`_resetView`). Awaiting `whenReady` *before* `fitBounds` deadlocks when the map is created
+     * without `center` + `zoom` in options.
+     */
+    /** @type {L.Map | null} */
+    let printMap = null;
+    try {
+      pdfExportLog("L.map(…) …");
+      printMap = L.map(container, {
+        attributionControl: false,
+        zoomControl: false,
+        zoomSnap: 0,
+        zoomDelta: 0.05,
+        maxZoom: maxZoom,
+      });
+      pdfExportLog("L.map returned");
+    } catch (err) {
+      console.error("[actomap PDF] map init failed", err);
+      safeRemoveExportMap(printMap);
+      stage.innerHTML = "";
+      setExportStatus("Map init failed — see console (search actomap PDF).");
+      return;
+    }
+
+    await new Promise(function (resolve) {
+      requestAnimationFrame(function () {
+        requestAnimationFrame(resolve);
+      });
+    });
+    pdfExportLog("after double rAF");
+    if (!printMap) {
+      stage.innerHTML = "";
+      setExportStatus("Export failed (map handle lost).");
+      return;
+    }
     printMap.invalidateSize(false);
+    const zFromTable = pdfZoomFromScaleDenTable(scaleDen);
+    let zoomFromTableUsed = false;
+    /** True when table zoom was increased to fill extent (not EXPORT_PDF_ZOOM_TABLE_STRICT). */
+    let tableZoomLiftedToFit = false;
+    if (zFromTable !== null) {
+      const zTable = Math.min(maxZoom, Math.max(minZoom, zFromTable));
+      const zFitExtent = printMap.getBoundsZoom(bounds, false, L.point(0, 0));
+      let zUse = zTable;
+      if (!EXPORT_PDF_ZOOM_TABLE_STRICT && Number.isFinite(zFitExtent) && zFitExtent > zTable) {
+        zUse = Math.min(maxZoom, Math.max(minZoom, zFitExtent));
+        tableZoomLiftedToFit = zUse > zTable + 1e-6;
+        if (tableZoomLiftedToFit) {
+          pdfExportLog("table zoom < extent fit; raising zoom to fill print map", {
+            scaleDen: scaleDen,
+            zTable: zTable,
+            zFitExtent: zFitExtent,
+            zUse: zUse,
+          });
+        }
+      } else if (EXPORT_PDF_ZOOM_TABLE_STRICT && Number.isFinite(zFitExtent) && zFitExtent > zTable + 1e-6) {
+        console.warn("[actomap PDF] EXPORT_PDF_ZOOM_TABLE_STRICT: table zoom is wider than extent — expect letterbox / tiny crop", {
+          zTable: zTable,
+          zFitExtent: zFitExtent,
+        });
+      }
+      pdfExportLog("setView from EXPORT_PDF_ZOOM_BY_SCALE_DEN", {
+        scaleDen: scaleDen,
+        zRequested: zFromTable,
+        zTable: zTable,
+        zUse: zUse,
+      });
+      printMap.setView(bounds.getCenter(), zUse, { animate: false });
+      printMap.invalidateSize(false);
+      if (!exportBoundsFullyInMapViewport(printMap, bounds, 2)) {
+        console.warn("[actomap PDF] table / blended zoom does not show full export bounds — using fitBounds", {
+          scaleDen: scaleDen,
+          zUse: zUse,
+        });
+        printMap.fitBounds(bounds, { animate: false, padding: [0, 0] });
+        printMap.invalidateSize(false);
+        tableZoomLiftedToFit = false;
+      } else {
+        zoomFromTableUsed = true;
+      }
+    } else {
+      pdfExportLog("fitBounds …");
+      printMap.fitBounds(bounds, { animate: false, padding: [0, 0] });
+      printMap.invalidateSize(false);
+    }
 
     const zFit = printMap.getZoom();
-    /*
-     * Do not set maxNativeZoom below the map’s rounded zoom: Leaflet would load lower-z tiles and
-     * scale them up (huge labels). Omit maxNativeZoom so the grid uses native tiles at Math.round(zFit).
-     */
+    pdfExportLog("print map view set", {
+      zFit: zFit,
+      zTile: Math.round(zFit),
+      zoomFromTable: zoomFromTableUsed,
+      tableZoomLiftedToFit: tableZoomLiftedToFit,
+    });
+    const boundsZoomFit = printMap.getBoundsZoom(bounds);
+    const mapSizeAfterFit = printMap.getSize();
+    console.groupCollapsed("[actomap PDF export] layout → Leaflet zoom");
+    console.log("pixel plan", {
+      WBase: WBase,
+      HBase: HBase,
+      fitPxScale: fitPxScale,
+      mapInnerPx: { W: W, H: H },
+      captureOuterPx: { outerW: outerW, outerH: outerH },
+    });
+    console.log("export-stage DOM", {
+      offsetWidth: stage.offsetWidth,
+      offsetHeight: stage.offsetHeight,
+      clientWidth: stage.clientWidth,
+      clientHeight: stage.clientHeight,
+      styleWidth: stage.style.width,
+      styleHeight: stage.style.height,
+    });
+    console.log("map container DOM", {
+      offsetWidth: container.offsetWidth,
+      offsetHeight: container.offsetHeight,
+      clientWidth: container.clientWidth,
+      clientHeight: container.clientHeight,
+    });
+    console.log("printMap.getSize()", mapSizeAfterFit.x, mapSizeAfterFit.y);
+    console.log(
+      "zoom: getBoundsZoom(bounds)",
+      boundsZoomFit,
+      "| getZoom after fitBounds",
+      zFit,
+      "| Math.round(z)",
+      Math.round(zFit),
+    );
+    console.log("TILE_CONFIG", { minZoom: minZoom, maxZoom: maxZoom });
+    const zDisplay = Math.min(maxZoom, Math.max(minZoom, Math.round(zFit)));
+    const maxNativeZoom = zoomFromTableUsed
+      ? zDisplay
+      : Math.min(maxZoom, Math.max(minZoom, zDisplay - EXPORT_PDF_TILE_LEVELS_COARSER));
+    console.log(
+      "PDF tiles: display z≈",
+      zDisplay,
+      "maxNativeZoom",
+      maxNativeZoom,
+      zoomFromTableUsed ? "(full z; scale table)" : "(− " + EXPORT_PDF_TILE_LEVELS_COARSER + " levels)",
+    );
+    console.groupEnd();
     const layer = L.tileLayer(url, {
       minZoom,
       maxZoom,
+      maxNativeZoom,
       tms,
       attribution: "Tiles",
-    });
-    layer.addTo(printMap);
-
-    await new Promise(function (resolve) {
-      printMap.whenReady(resolve);
+      ...TILE_LAYER_OPTIONS,
     });
 
+    setExportStatus("Loading map tiles for PDF…");
+    pdfExportLog("waiting for tiles (max 60s)…");
     await new Promise(function (resolve) {
-      waitForTiles(printMap, layer, resolve, 12000);
+      waitForTileLayerReady(printMap, layer, resolve, 60000);
     });
 
     /** Small extra delay so decoded images paint */
+    pdfExportLog("tile wait finished, brief paint delay…");
     await new Promise(function (r) {
       setTimeout(r, 250);
     });
+    pdfExportLog("starting rasterise → PDF");
 
     const captureMaxEdge = Math.max(outerW, outerH, 1);
     const h2cScale = Math.min(
       EXPORT_HTML2CANVAS_SCALE_MAX,
       EXPORT_CAPTURE_MAX_EDGE_PX / captureMaxEdge,
     );
+    const layerAny = /** @type {any} */ (layer);
+    const tileZoomInternal = layerAny._tileZoom;
+    const domTiles = container.querySelectorAll("img.leaflet-tile");
+    /** @param {string} src */
+    function tileZFromUrl(src) {
+      const m = /\/(\d+)\/\d+\/\d+\.(?:png|jpe?g|webp)/i.exec(src);
+      return m ? Number(m[1]) : null;
+    }
+    const zs = [];
+    domTiles.forEach(function (img) {
+      const z = tileZFromUrl(img.src);
+      if (z !== null) zs.push(z);
+    });
+    console.groupCollapsed("[actomap PDF export] tiles loaded + rasterise");
+    console.log("layer._tileZoom (Leaflet grid)", tileZoomInternal);
+    console.log("map.getZoom()", printMap.getZoom());
+    console.log("DOM leaflet-tile count", domTiles.length);
+    if (zs.length) {
+      const zMin = Math.min.apply(null, zs);
+      const zMax = Math.max.apply(null, zs);
+      console.log("z from tile URLs (min … max)", zMin, "…", zMax, "(sample)", zs.slice(0, 6));
+      if (domTiles[0]) console.log("first tile src", domTiles[0].src);
+    } else {
+      console.warn("No tile URLs parsed — check network / CORS / tile template.");
+    }
+    console.log("html2canvas", {
+      captureMaxEdge: captureMaxEdge,
+      h2cScale: h2cScale,
+      expectedBitmapApprox: { w: Math.round(outerW * h2cScale), h: Math.round(outerH * h2cScale) },
+    });
+    console.groupEnd();
+
+    const winW = Math.ceil(outerW);
+    const winH = Math.ceil(outerH);
+    console.log("[actomap PDF export] raster", { doCrop: doCrop, winW: winW, winH: winH, h2cScale: h2cScale });
+
     let canvas;
     try {
-      canvas = await h2c(captureEl, {
-        useCORS: true,
-        allowTaint: false,
-        backgroundColor: "#1c2430",
-        width: outerW,
-        height: outerH,
-        scale: h2cScale,
-      });
+      if (!doCrop) {
+        canvas = rasterizeLeafletTilesFromElement(captureEl, winW, winH, h2cScale);
+      } else {
+        const h2c = getHtml2CanvasFn();
+        if (!h2c) {
+          throw new Error("html2canvas not available (needed for magnetic-north PDF rotation).");
+        }
+        /*
+         * html2canvas clones into an iframe; wrong window size re-fetches tiles at the wrong z.
+         * Oversize the cloned document + stage; windowWidth/Height set the iframe (see html2canvas Bounds).
+         */
+        canvas = await h2c(captureEl, {
+          useCORS: true,
+          allowTaint: false,
+          backgroundColor: "#1c2430",
+          logging: false,
+          width: winW,
+          height: winH,
+          scale: h2cScale,
+          windowWidth: winW,
+          windowHeight: winH,
+          scrollX: 0,
+          scrollY: 0,
+          onclone: function (clonedDoc) {
+            const de = clonedDoc.documentElement;
+            const body = clonedDoc.body;
+            if (de) {
+              de.style.width = winW + "px";
+              de.style.height = winH + "px";
+              de.style.overflow = "visible";
+            }
+            if (body) {
+              body.style.width = winW + "px";
+              body.style.height = winH + "px";
+              body.style.margin = "0";
+              body.style.padding = "0";
+              body.style.overflow = "visible";
+            }
+            const stCl = clonedDoc.getElementById("export-stage");
+            if (stCl) {
+              stCl.style.cssText =
+                "position:fixed;left:0;top:0;width:" +
+                winW +
+                "px;height:" +
+                winH +
+                "px;opacity:1;overflow:visible;pointer-events:none;z-index:0;";
+            }
+          },
+        });
+      }
     } catch (e) {
-      printMap.remove();
+      safeRemoveExportMap(printMap);
       stage.innerHTML = "";
       setExportStatus("Could not rasterise map (often CORS on tiles).");
       console.error(e);
       return;
+    }
+    console.log("[actomap PDF export] canvas pixel size", canvas.width, canvas.height);
+
+    /*
+     * fitBounds keeps the whole LatLngBounds visible; Mercator vs container aspect often letterboxes,
+     * so getBounds() is larger than `bounds` and the raster would show extra map (wrong 1:scale vs orange extent).
+     */
+    if (!doCrop) {
+      const aabb = exportBoundsContainerPxAabb(printMap, bounds);
+      const loose = 1.5;
+      if (aabb.w < W - loose || aabb.h < H - loose) {
+        const sxB = Math.max(0, Math.floor(aabb.minX * h2cScale));
+        const syB = Math.max(0, Math.floor(aabb.minY * h2cScale));
+        let swB = Math.max(1, Math.ceil(aabb.w * h2cScale));
+        let shB = Math.max(1, Math.ceil(aabb.h * h2cScale));
+        swB = Math.min(swB, canvas.width - sxB);
+        shB = Math.min(shB, canvas.height - syB);
+        if (swB > 4 && shB > 4 && (swB < canvas.width - 2 || shB < canvas.height - 2)) {
+          const cBounds = document.createElement("canvas");
+          cBounds.width = swB;
+          cBounds.height = shB;
+          const ctxB = cBounds.getContext("2d");
+          if (ctxB) {
+            ctxB.drawImage(canvas, sxB, syB, swB, shB, 0, 0, swB, shB);
+            canvas = cBounds;
+            console.log("[actomap PDF export] cropped letterbox to export bounds", {
+              sx: sxB,
+              sy: syB,
+              sw: swB,
+              sh: shB,
+              aabbCss: aabb,
+            });
+          }
+        }
+      }
     }
 
     const sW = Math.round(W * h2cScale);
@@ -981,7 +1476,25 @@
       canvas = c2;
     }
 
-    const imgData = canvas.toDataURL("image/png");
+    const prePdfEmbedW = canvas.width;
+    const prePdfEmbedH = canvas.height;
+    canvas = clampCanvasLongEdgeForJsPdf(canvas, EXPORT_JSPDF_MAX_IMAGE_LONG_EDGE_PX);
+    const pdfRasterScaledForJsPdf =
+      canvas.width !== prePdfEmbedW || canvas.height !== prePdfEmbedH;
+
+    let imgData;
+    try {
+      imgData = canvas.toDataURL("image/jpeg", EXPORT_PDF_JPEG_QUALITY);
+    } catch (err) {
+      console.error("[actomap PDF] toDataURL failed (tainted canvas?)", err);
+      safeRemoveExportMap(printMap);
+      stage.innerHTML = "";
+      setExportStatus(
+        "PDF blocked: tiles must allow CORS. On your tile server send header Access-Control-Allow-Origin " +
+          "(e.g. *). Reload so tiles reload with crossOrigin. See TILE_CONFIG comment in app.js.",
+      );
+      return;
+    }
     const { jsPDF } = jsPdfMod;
     const orientation = widthMm >= heightMm ? "landscape" : "portrait";
     const pdf = new jsPDF({
@@ -990,7 +1503,7 @@
       format: paper,
     });
 
-    pdf.addImage(imgData, "PNG", 0, 0, widthMm, heightMm);
+    pdf.addImage(imgData, "JPEG", 0, 0, widthMm, heightMm);
     let subjectBase = "Scale 1:" + scaleDen + " · " + paper + " " + orient;
     if (doCrop && declUsed !== null) {
       subjectBase += " · magnetic north up (D≈" + declUsed + "° E)";
@@ -1022,7 +1535,7 @@
 
     downloadPdfBytes(outBytes, fname);
 
-    printMap.remove();
+    safeRemoveExportMap(printMap);
     stage.innerHTML = "";
     let doneMsg = "Saved " + fname;
     if (doCrop && declUsed !== null) {
@@ -1035,16 +1548,30 @@
     } else if (!window.PDFLib) {
       doneMsg += " — pdf-lib missing; PDF not georeferenced.";
     }
+    if (zoomFromTableUsed) {
+      doneMsg +=
+        " — print zoom from scale table (1:" + scaleDen + " → z≈" + zFit.toFixed(2) + (tableZoomLiftedToFit ? "; raised to fill extent" : "") + ").";
+    }
     doneMsg +=
       " — export zoom ≈ " +
       zFit.toFixed(2) +
-      " (tile z ≈ " +
-      Math.round(zFit) +
-      ", " +
+      " (PDF tiles z≤" +
+      maxNativeZoom +
+      ", view z≈" +
+      zDisplay +
+      "; " +
       fitPxScale +
-      "× map, capture scale " +
+      "× map, capture " +
       h2cScale.toFixed(2) +
       ").";
+    if (pdfRasterScaledForJsPdf) {
+      doneMsg +=
+        " — PDF image ≤" +
+        EXPORT_JSPDF_MAX_IMAGE_LONG_EDGE_PX +
+        "px edge (JPEG " +
+        Math.round(EXPORT_PDF_JPEG_QUALITY * 100) +
+        "%) for encoder limits.";
+    }
     setExportStatus(doneMsg);
   }
 
@@ -1065,8 +1592,14 @@
     if (pdfBtn) {
       pdfBtn.addEventListener("click", function () {
         exportPdf().catch(function (e) {
-          console.error(e);
-          setExportStatus("Export failed — see console.");
+          console.error("[actomap PDF] exportPdf rejected", e);
+          const msg =
+            e && e.message
+              ? String(e.message)
+              : e
+                ? String(e)
+                : "unknown error";
+          setExportStatus("Export failed: " + msg);
         });
       });
     }
