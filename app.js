@@ -186,18 +186,39 @@
    *
    * PDF export draws tiles to a canvas → needs CORS: tile responses must include
    * `Access-Control-Allow-Origin` (e.g. `*` or your app origin). `crossOrigin: true` on the layer
-   * requests anonymous CORS; without the header, `toDataURL` throws “tainted canvas”.
+   * requests anonymous CORS; without the header, tiles fail to load (or `toDataURL` throws “tainted canvas”).
+   *
+   * If the tile server has no CORS yet: open the app with `?tilesCors=0` to view the map only (PDF export
+   * stays disabled until the server sends `Access-Control-Allow-Origin` and you reload without that flag).
    */
   const TILE_CONFIG = {
-    url: "http://localhost:8765/{z}/{x}/{y}.png",
+    url: "https://actomaptiletest.ryan-stocks.com/{z}/{x}/{y}.png",
     tms: false,
     minZoom: 0,
     maxZoom: 17,
+    /** Request CORS so PDF export works; set `false` only with matching `?tilesCors=0` behaviour. */
+    tileCrossOrigin: true,
   };
 
-  const TILE_LAYER_OPTIONS = {
-    crossOrigin: true,
-  };
+  function tileCrossOriginFromConfig() {
+    const q = new URLSearchParams(window.location.search);
+    if (q.get("tilesCors") === "0" || q.get("tilesCors") === "false") return false;
+    if (q.get("tilesCors") === "1") return true;
+    return TILE_CONFIG.tileCrossOrigin !== false;
+  }
+
+  function leafletTileCrossOriginOptions() {
+    return { crossOrigin: tileCrossOriginFromConfig() };
+  }
+
+  function tileConfigUrlHost() {
+    try {
+      const u = TILE_CONFIG.url.replace(/\{[zxy]\}/gi, "0");
+      return new URL(u).host;
+    } catch {
+      return "your tile host";
+    }
+  }
 
   const PAPER_MM = {
     A4: { short: 210, long: 297 },
@@ -291,7 +312,7 @@
       maxZoom,
       tms,
       attribution: "Tiles",
-      ...TILE_LAYER_OPTIONS,
+      ...leafletTileCrossOriginOptions(),
     });
 
     tileLayer.on("tileerror", function (ev) {
@@ -979,6 +1000,14 @@
       setExportStatus("Expand Export to PDF and position the orange outline first.");
       return;
     }
+    if (!tileCrossOriginFromConfig()) {
+      setExportStatus(
+        "PDF needs CORS on the tile host. Add Access-Control-Allow-Origin on " +
+          tileConfigUrlHost() +
+          ", then reload without ?tilesCors=0.",
+      );
+      return;
+    }
 
     const bounds = exportBounds;
     const center = bounds.getCenter();
@@ -1151,7 +1180,7 @@
       maxNativeZoom,
       tms,
       attribution: "Tiles",
-      ...TILE_LAYER_OPTIONS,
+      ...leafletTileCrossOriginOptions(),
     };
     if (!doCrop) layerOpts.bounds = bounds;
     const layer = L.tileLayer(url, layerOpts);
