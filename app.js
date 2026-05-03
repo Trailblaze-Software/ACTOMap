@@ -34,8 +34,8 @@
    * See EXPORT_PDF_ZOOM_TABLE_STRICT if z is below extent-fit.
    */
   const EXPORT_PDF_ZOOM_BY_SCALE_DEN = {
-    5000: 18,
-    10000: 17,
+    5000: 17,
+    10000: 16,
     15000: 16,
     25000: 15,
     50000: 14,
@@ -254,8 +254,8 @@
     const scaleEl = document.getElementById("scale-den");
     const scaleDen = scaleEl ? Number(scaleEl.value) : 25000;
     const dpi = EXPORT_RASTER_DPI;
-    const magEl = document.getElementById("pdf-magnetic-north");
-    const magneticNorthUp = !!(magEl && magEl.checked);
+    /** PDF magnetic export hidden: georef vs rotation still wrong; re-enable when fixed. */
+    const magneticNorthUp = false;
     return { paper, orient, scaleDen, dpi, magneticNorthUp };
   }
 
@@ -558,43 +558,55 @@
   }
 
   /**
-   * Corners of the centre-cropped page in pre-crop canvas pixels → lat/lng via inverse of CSS rotate(-dec)
-   * on the print map (same φ as boundsCornersRotatedScreen).
+   * Map outer html2canvas pixel (origin top-left of rotated outer) → lat/lng (inverse CSS rotate(-dec)).
    *
    * @param {L.Map} printMap
    * @param {number} decDeg east-positive declination
-   * @param {number} W crop width / inner map px
-   * @param {number} H crop height
-   * @param {number} canvasW html2canvas width before centre crop
-   * @param {number} canvasH
-   * @param {number} sx crop left (centred)
-   * @param {number} sy crop top
-   * @returns {number[]} GPTS length 8
+   * @param {number} W inner map CSS px width
+   * @param {number} H inner map CSS px height
+   * @param {number} canvasW pre-crop canvas width
+   * @param {number} canvasH pre-crop canvas height
+   * @param {number} px
+   * @param {number} py
+   * @param {number} ps pixel scale (html2canvas scale)
    */
-  function gptsFromMagneticCentreCrop(printMap, decDeg, W, H, canvasW, canvasH, sx, sy, pixelScale) {
-    const ps = pixelScale && pixelScale > 0 ? pixelScale : 1;
+  function magneticOuterPxToLatLng(printMap, decDeg, W, H, canvasW, canvasH, px, py, ps) {
     const Ox = canvasW / 2;
     const Oy = canvasH / 2;
     const phi = (-decDeg * Math.PI) / 180;
     const cos = Math.cos(phi);
     const sin = Math.sin(phi);
+    const rxo = px - Ox;
+    const ryo = py - Oy;
+    const dx = rxo * cos - ryo * sin;
+    const dy = rxo * sin + ryo * cos;
+    const lx = W / 2 + dx / ps;
+    const ly = H / 2 + dy / ps;
+    return printMap.containerPointToLatLng(L.point(lx, ly));
+  }
 
-    function pxToLatLng(px, py) {
-      const rxo = px - Ox;
-      const ryo = py - Oy;
-      const dx = rxo * cos - ryo * sin;
-      const dy = rxo * sin + ryo * cos;
-      const lx = W / 2 + dx / ps;
-      const ly = H / 2 + dy / ps;
-      return printMap.containerPointToLatLng(L.point(lx, ly));
+  /**
+   * @param {L.Map} printMap
+   * @param {number} decDeg
+   * @param {number} W
+   * @param {number} H
+   * @param {number} canvasW
+   * @param {number} canvasH
+   * @param {number} sx
+   * @param {number} sy
+   * @param {number} sw
+   * @param {number} sh
+   * @param {number} ps
+   * @returns {number[]}
+   */
+  function gptsFromMagneticCropRect(printMap, decDeg, W, H, canvasW, canvasH, sx, sy, sw, sh, ps) {
+    function p2ll(px, py) {
+      return magneticOuterPxToLatLng(printMap, decDeg, W, H, canvasW, canvasH, px, py, ps);
     }
-
-    const cw = W * ps;
-    const ch = H * ps;
-    const swLL = pxToLatLng(sx, sy + ch);
-    const nwLL = pxToLatLng(sx, sy);
-    const neLL = pxToLatLng(sx + cw, sy);
-    const seLL = pxToLatLng(sx + cw, sy + ch);
+    const swLL = p2ll(sx, sy + sh);
+    const nwLL = p2ll(sx, sy);
+    const neLL = p2ll(sx + sw, sy);
+    const seLL = p2ll(sx + sw, sy + sh);
     return [swLL.lat, swLL.lng, nwLL.lat, nwLL.lng, neLL.lat, neLL.lng, seLL.lat, seLL.lng];
   }
 
@@ -1133,15 +1145,16 @@
     const maxNativeZoom = zoomFromTableUsed
       ? zDisplay
       : Math.min(maxZoom, Math.max(minZoom, zDisplay - EXPORT_PDF_TILE_LEVELS_COARSER));
-    const layer = L.tileLayer(url, {
-      bounds: bounds,
+    const layerOpts = {
       minZoom,
       maxZoom,
       maxNativeZoom,
       tms,
       attribution: "Tiles",
       ...TILE_LAYER_OPTIONS,
-    });
+    };
+    if (!doCrop) layerOpts.bounds = bounds;
+    const layer = L.tileLayer(url, layerOpts);
 
     setExportStatus("Loading map tiles for PDF…");
     await new Promise(function (resolve) {
@@ -1224,6 +1237,9 @@
      * fitBounds keeps the whole LatLngBounds visible; Mercator vs container aspect often letterboxes,
      * so getBounds() is larger than `bounds` and the raster would show extra map (wrong 1:scale vs orange extent).
      */
+    /** @type {{ sx: number; sy: number; sw: number; sh: number; preW: number; preH: number } | null} */
+    let magneticCropOnOuter = null;
+
     if (!doCrop) {
       const aabb = exportBoundsContainerPxAabb(printMap, bounds);
       const loose = 1.5;
@@ -1245,39 +1261,48 @@
           }
         }
       }
-    }
-
-    const sW = Math.round(W * h2cScale);
-    const sH = Math.round(H * h2cScale);
-    let sxCrop = 0;
-    let syCrop = 0;
-    if (doCrop && canvas.width >= sW && canvas.height >= sH) {
-      sxCrop = Math.round((canvas.width - sW) / 2);
-      syCrop = Math.round((canvas.height - sH) / 2);
+    } else if (declUsed !== null && Math.abs(declUsed) > 0.001) {
+      const aabb = exportBoundsContainerPxAabb(printMap, bounds);
+      const padL = (outerW - W) / 2;
+      const padT = (outerH - H) / 2;
+      const s = h2cScale;
+      let sxB = Math.floor((aabb.minX + padL) * s);
+      let syB = Math.floor((aabb.minY + padT) * s);
+      let swB = Math.max(1, Math.ceil(aabb.w * s));
+      let shB = Math.max(1, Math.ceil(aabb.h * s));
+      sxB = Math.max(0, Math.min(sxB, canvas.width - 2));
+      syB = Math.max(0, Math.min(syB, canvas.height - 2));
+      swB = Math.min(swB, canvas.width - sxB);
+      shB = Math.min(shB, canvas.height - syB);
+      if (swB > 4 && shB > 4) {
+        magneticCropOnOuter = { sx: sxB, sy: syB, sw: swB, sh: shB, preW: canvas.width, preH: canvas.height };
+        const cMag = document.createElement("canvas");
+        cMag.width = swB;
+        cMag.height = shB;
+        const ctxM = cMag.getContext("2d");
+        if (ctxM) {
+          ctxM.drawImage(canvas, sxB, syB, swB, shB, 0, 0, swB, shB);
+          canvas = cMag;
+        }
+      }
     }
 
     let gptsForEmbed = gptsFromBoundsBox(bounds);
-    if (doCrop && declUsed !== null && Math.abs(declUsed) > 0.001 && canvas.width >= sW && canvas.height >= sH) {
-      gptsForEmbed = gptsFromMagneticCentreCrop(
+    if (magneticCropOnOuter && declUsed !== null && Math.abs(declUsed) > 0.001) {
+      const m = magneticCropOnOuter;
+      gptsForEmbed = gptsFromMagneticCropRect(
         printMap,
         declUsed,
         W,
         H,
-        canvas.width,
-        canvas.height,
-        sxCrop,
-        syCrop,
+        m.preW,
+        m.preH,
+        m.sx,
+        m.sy,
+        m.sw,
+        m.sh,
         h2cScale,
       );
-    }
-
-    if (doCrop && canvas.width >= sW && canvas.height >= sH) {
-      const c2 = document.createElement("canvas");
-      c2.width = sW;
-      c2.height = sH;
-      const ctx2 = c2.getContext("2d");
-      if (ctx2) ctx2.drawImage(canvas, sxCrop, syCrop, sW, sH, 0, 0, sW, sH);
-      canvas = c2;
     }
 
     const prePdfEmbedW = canvas.width;
@@ -1406,6 +1431,7 @@
 
     const pdfMag = document.getElementById("pdf-magnetic-north");
     if (pdfMag) {
+      pdfMag.checked = false;
       const onPdfMagnetic = function () {
         if (exportOutline && exportBounds) refreshExportOutline();
       };

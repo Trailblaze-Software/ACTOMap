@@ -82,13 +82,15 @@
                 <option value="250000">1 : 250 000</option>
               </select>
             </label>
-            <label class="check">
-              <input type="checkbox" id="pdf-magnetic-north" />
-              <span>Orient PDF to magnetic north (WMM2020)</span>
-            </label>
-            <p class="hint export-hint">
-              Rotates the export so <strong>page top ≈ magnetic north</strong>.
-            </p>
+            <div id="pdf-magnetic-export-wrap" class="export-magnetic-pdf" hidden aria-hidden="true">
+              <label class="check">
+                <input type="checkbox" id="pdf-magnetic-north" />
+                <span>Orient PDF to magnetic north (WMM2020)</span>
+              </label>
+              <p class="hint export-hint">
+                Rotates the export so <strong>page top ≈ magnetic north</strong>.
+              </p>
+            </div>
             <div class="export-actions">
               <button type="button" class="btn ghost" id="export-cancel">Cancel</button>
               <button type="button" class="btn primary" id="export-pdf">Download PDF</button>
@@ -123,6 +125,6 @@
     <script src="https://unpkg.com/proj4@2.11.0/dist/proj4.js" crossorigin=""></script>
     <script src="./vendor/geomag.js"></script>
     <!-- Bump ?v= when app.js changes so browsers don’t keep an old cached copy -->
-    <script src="./app.js?v=20260502m"></script>
+    <script src="./app.js?v=20260502o"></script>
   </body>
 </html>
