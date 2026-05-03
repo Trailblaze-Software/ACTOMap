@@ -15,55 +15,23 @@
   /** Upper bound for html2canvas `scale` when the map fits in EXPORT_CAPTURE_MAX_EDGE_PX. */
   const EXPORT_HTML2CANVAS_SCALE_MAX = 2;
 
-  /**
-   * Max longest edge of the rasterised bitmap (avoids canvas limits; typical ~8k–16k).
-   * The off-screen map can be larger; scale is reduced so output stays within this.
-   * Keep ≥ EXPORT_MAP_MAX_LONG_EDGE_PX so +1 zoom (2× map) is not downsampled at rasterise.
-   */
+  /** Raster canvas long-edge cap; keep ≥ EXPORT_MAP_MAX_LONG_EDGE_PX. */
   const EXPORT_CAPTURE_MAX_EDGE_PX = 16384;
-
-  /**
-   * Target multiplier for off-screen map width/height vs paper×DPI (higher → higher Leaflet zoom).
-   * Very large values (e.g. 16 → ~40k px edges) freeze the tab: thousands of tiles and brutal layout.
-   * Effective scale is also capped by EXPORT_MAP_MAX_LONG_EDGE_PX.
-   */
+  /** Print map CSS px multiplier vs paper@DPI; capped by EXPORT_MAP_MAX_LONG_EDGE_PX. */
   const EXPORT_FIT_ZOOM_PIXEL_SCALE = 4;
-
-  /**
-   * Hard limit on max(width,height) of the print map in CSS pixels (layout + tile count).
-   * `fitPxScale` uses the full ratio up to this cap (not floored). Raised so EXPORT_PDF_EXTRA_ZOOM_LEVELS
-   * can double size (~+1 Leaflet zoom for the same bounds) without always hitting this ceiling.
-   */
+  /** Print map max(width,height) in CSS px. */
   const EXPORT_MAP_MAX_LONG_EDGE_PX = 16384;
-
-  /**
-   * Extra whole Leaflet zoom levels for the same export bounds: width/height are multiplied by 2^n after
-   * fitPxScale (Web Mercator: ~one zoom level ≈ double pixels per axis for the same geographic span).
-   */
+  /** After fitPxScale, multiply W×H by 2^n (~+n zoom for same bounds). */
   const EXPORT_PDF_EXTRA_ZOOM_LEVELS = 1;
-
-  /**
-   * jsPDF re-decodes raster data for PNG; very large bitmaps throw RangeError (Invalid array length).
-   * Final map image is scaled down to fit this longest edge before embedding (georef uses page mm + GPTS).
-   */
+  /** Max bitmap long edge before JPEG embed (jsPDF PNG path breaks on huge images). */
   const EXPORT_JSPDF_MAX_IMAGE_LONG_EDGE_PX = 4096;
-
-  /** Quality for JPEG map image in PDF (after optional downscale). */
   const EXPORT_PDF_JPEG_QUALITY = 0.93;
-
-  /**
-   * PDF export only: load tiles this many zoom levels **coarser** than the fitted map zoom.
-   * Leaflet upscales them → far fewer tile requests (≈4× fewer per step in each axis).
-   * Labels look larger/softer; increase fit pixel scale or reduce this if type is too fuzzy.
-   */
+  /** Non–scale-table PDF tiles: load this many levels below display z (fewer requests, softer). */
   const EXPORT_PDF_TILE_LEVELS_COARSER = 3;
 
   /**
-   * Fixed Leaflet zoom per scale denominator (the `1 : scaleDen` from the export form).
-   * Tune from your tile pyramid / labelling (not replaced by tooling). If a value is **lower** than
-   * the zoom needed to fill the orange extent on the print map, code may **raise** zoom unless
-   * EXPORT_PDF_ZOOM_TABLE_STRICT — see that flag.
-   * Fractional zoom allowed (`zoomSnap: 0`). `{}` = always fitBounds.
+   * Optional fixed zoom per `1:scaleDen`; tune to your tiles. `{}` ⇒ fitBounds only.
+   * See EXPORT_PDF_ZOOM_TABLE_STRICT if z is below extent-fit.
    */
   const EXPORT_PDF_ZOOM_BY_SCALE_DEN = {
     5000: 18,
@@ -444,37 +412,26 @@
     if (chk && chk.checked) updateMainMapMagnetic();
   }
 
-  /**
-   * @param {L.Map} leafletMap
-   * @param {L.TileLayer | null} activeLayer
-   * @param {() => void} done
-   * @param {number} maxWaitMs
-   */
-  /**
-   * Registers `load` before `addTo` so fast/cached tiles don’t miss the event.
-   * Always ends by maxWaitMs so export never hangs indefinitely.
-   */
+  /** `load` registered before `addTo`; always finishes by maxWaitMs. */
   function waitForTileLayerReady(leafletMap, layer, done, maxWaitMs) {
     if (!layer) {
-      pdfExportLog("tiles: no layer, skip wait");
       done();
       return;
     }
     let settled = false;
-    function finish(reason) {
+    function finish() {
       if (settled) return;
       settled = true;
-      pdfExportLog("tiles: done — " + reason);
       done();
     }
     const hardStop = window.setTimeout(function () {
-      finish("timeout after " + maxWaitMs + "ms (check tile server / network)");
+      console.warn("[actomap PDF] tile wait timeout " + maxWaitMs + "ms");
+      finish();
     }, maxWaitMs);
     layer.once("load", function () {
       window.clearTimeout(hardStop);
-      finish("Leaflet tile layer load event");
+      finish();
     });
-    pdfExportLog("tiles: layer.addTo(printMap) …");
     layer.addTo(leafletMap);
   }
 
@@ -490,16 +447,6 @@
       m.remove();
     } catch (e) {
       console.warn("[actomap PDF] map.remove()", e);
-    }
-  }
-
-  /** Always use plain console.log so messages show even if “group” logging is collapsed. */
-  function pdfExportLog(step, detail) {
-    const t = typeof performance !== "undefined" && performance.now ? performance.now().toFixed(0) : "?";
-    if (detail !== undefined) {
-      console.log("[actomap PDF +" + t + "ms] " + step, detail);
-    } else {
-      console.log("[actomap PDF +" + t + "ms] " + step);
     }
   }
 
@@ -556,7 +503,6 @@
     ctx.imageSmoothingEnabled = true;
     ctx.imageSmoothingQuality = "high";
     ctx.drawImage(src, 0, 0, tw, th);
-    console.log("[actomap PDF export] scaled for jsPDF embed", w, "×", h, "→", tw, "×", th);
     return out;
   }
 
@@ -581,7 +527,6 @@
     ctx.fillStyle = "#1c2430";
     ctx.fillRect(0, 0, cw, ch);
     const rootRect = rootEl.getBoundingClientRect();
-    let drawn = 0;
     rootEl.querySelectorAll("img.leaflet-tile").forEach(function (img) {
       if (!img.complete || img.naturalWidth === 0) return;
       const r = img.getBoundingClientRect();
@@ -592,12 +537,10 @@
       if (dw < 0.25 || dh < 0.25) return;
       try {
         ctx.drawImage(img, dx, dy, dw, dh);
-        drawn += 1;
       } catch (err) {
         console.warn("[actomap PDF] tile drawImage skipped", err);
       }
     });
-    console.log("[actomap PDF export] rasterizeLeafletTiles drew", drawn, "images →", canvas.width, "×", canvas.height);
     return canvas;
   }
 
@@ -1062,18 +1005,6 @@
     }
 
     setExportStatus("Preparing export…");
-    pdfExportLog("start exportPdf", {
-      WBase: WBase,
-      HBase: HBase,
-      W: W,
-      H: H,
-      fitPxDesired: fitPxDesired,
-      fitPxScale: fitPxScale,
-      capped: fitPxScale < fitPxDesired,
-      extraZoomLevels: extraZoomLevels,
-      mapLongEdge: Math.max(W, H),
-      mapFitShrink: fitShrink,
-    });
 
     const stage = document.getElementById("export-stage");
     if (!stage) {
@@ -1082,7 +1013,6 @@
       return;
     }
     stage.innerHTML = "";
-    pdfExportLog("stage cleared");
 
     const container = document.createElement("div");
     container.style.width = W + "px";
@@ -1095,15 +1025,11 @@
     let declUsed = null;
 
     if (magneticNorthUp) {
-      pdfExportLog("magnetic: declination lookup…");
       const dec = magneticDeclinationDeg(center.lat, center.lng);
-      pdfExportLog("magnetic: declination", dec);
       if (dec === null) {
         setExportStatus("Magnetic model unavailable; PDF uses true north.");
-        pdfExportLog("append container (no rotation)…");
         stage.appendChild(container);
       } else if (Math.abs(dec) <= 0.001) {
-        pdfExportLog("append container (declination ~0)…");
         stage.appendChild(container);
         declUsed = dec;
       } else {
@@ -1127,33 +1053,20 @@
           -dec +
           "deg);transform-origin:center center;";
         outer.appendChild(container);
-        pdfExportLog("append outer+rotated map (sync layout may pause here if W×H is large)…");
         stage.appendChild(outer);
         captureEl = outer;
         doCrop = true;
       }
     } else {
-      pdfExportLog("append map container (sync layout may pause here if W×H is large)…");
       stage.appendChild(container);
     }
 
     stage.style.width = outerW + "px";
     stage.style.height = outerH + "px";
-    pdfExportLog("stage sized + container in DOM", {
-      outerW: outerW,
-      outerH: outerH,
-      stageOffset: { w: stage.offsetWidth, h: stage.offsetHeight },
-    });
 
-    /**
-     * Leaflet fires map `load` / marks `_loaded` only after the first `setView` / `fitBounds`
-     * (`_resetView`). Awaiting `whenReady` *before* `fitBounds` deadlocks when the map is created
-     * without `center` + `zoom` in options.
-     */
     /** @type {L.Map | null} */
     let printMap = null;
     try {
-      pdfExportLog("L.map(…) …");
       printMap = L.map(container, {
         attributionControl: false,
         zoomControl: false,
@@ -1161,7 +1074,6 @@
         zoomDelta: 0.05,
         maxZoom: maxZoom,
       });
-      pdfExportLog("L.map returned");
     } catch (err) {
       console.error("[actomap PDF] map init failed", err);
       safeRemoveExportMap(printMap);
@@ -1175,7 +1087,6 @@
         requestAnimationFrame(resolve);
       });
     });
-    pdfExportLog("after double rAF");
     if (!printMap) {
       stage.innerHTML = "";
       setExportStatus("Export failed (map handle lost).");
@@ -1193,26 +1104,12 @@
       if (!EXPORT_PDF_ZOOM_TABLE_STRICT && Number.isFinite(zFitExtent) && zFitExtent > zTable) {
         zUse = Math.min(maxZoom, Math.max(minZoom, zFitExtent));
         tableZoomLiftedToFit = zUse > zTable + 1e-6;
-        if (tableZoomLiftedToFit) {
-          pdfExportLog("table zoom < extent fit; raising zoom to fill print map", {
-            scaleDen: scaleDen,
-            zTable: zTable,
-            zFitExtent: zFitExtent,
-            zUse: zUse,
-          });
-        }
       } else if (EXPORT_PDF_ZOOM_TABLE_STRICT && Number.isFinite(zFitExtent) && zFitExtent > zTable + 1e-6) {
-        console.warn("[actomap PDF] EXPORT_PDF_ZOOM_TABLE_STRICT: table zoom is wider than extent — expect letterbox / tiny crop", {
+        console.warn("[actomap PDF] table zoom < extent-fit zoom; expect letterbox unless you raise z in the table.", {
           zTable: zTable,
           zFitExtent: zFitExtent,
         });
       }
-      pdfExportLog("setView from EXPORT_PDF_ZOOM_BY_SCALE_DEN", {
-        scaleDen: scaleDen,
-        zRequested: zFromTable,
-        zTable: zTable,
-        zUse: zUse,
-      });
       printMap.setView(bounds.getCenter(), zUse, { animate: false });
       printMap.invalidateSize(false);
       if (!exportBoundsFullyInMapViewport(printMap, bounds, 2)) {
@@ -1227,65 +1124,17 @@
         zoomFromTableUsed = true;
       }
     } else {
-      pdfExportLog("fitBounds …");
       printMap.fitBounds(bounds, { animate: false, padding: [0, 0] });
       printMap.invalidateSize(false);
     }
 
     const zFit = printMap.getZoom();
-    pdfExportLog("print map view set", {
-      zFit: zFit,
-      zTile: Math.round(zFit),
-      zoomFromTable: zoomFromTableUsed,
-      tableZoomLiftedToFit: tableZoomLiftedToFit,
-    });
-    const boundsZoomFit = printMap.getBoundsZoom(bounds);
-    const mapSizeAfterFit = printMap.getSize();
-    console.groupCollapsed("[actomap PDF export] layout → Leaflet zoom");
-    console.log("pixel plan", {
-      WBase: WBase,
-      HBase: HBase,
-      fitPxScale: fitPxScale,
-      mapInnerPx: { W: W, H: H },
-      captureOuterPx: { outerW: outerW, outerH: outerH },
-    });
-    console.log("export-stage DOM", {
-      offsetWidth: stage.offsetWidth,
-      offsetHeight: stage.offsetHeight,
-      clientWidth: stage.clientWidth,
-      clientHeight: stage.clientHeight,
-      styleWidth: stage.style.width,
-      styleHeight: stage.style.height,
-    });
-    console.log("map container DOM", {
-      offsetWidth: container.offsetWidth,
-      offsetHeight: container.offsetHeight,
-      clientWidth: container.clientWidth,
-      clientHeight: container.clientHeight,
-    });
-    console.log("printMap.getSize()", mapSizeAfterFit.x, mapSizeAfterFit.y);
-    console.log(
-      "zoom: getBoundsZoom(bounds)",
-      boundsZoomFit,
-      "| getZoom after fitBounds",
-      zFit,
-      "| Math.round(z)",
-      Math.round(zFit),
-    );
-    console.log("TILE_CONFIG", { minZoom: minZoom, maxZoom: maxZoom });
     const zDisplay = Math.min(maxZoom, Math.max(minZoom, Math.round(zFit)));
     const maxNativeZoom = zoomFromTableUsed
       ? zDisplay
       : Math.min(maxZoom, Math.max(minZoom, zDisplay - EXPORT_PDF_TILE_LEVELS_COARSER));
-    console.log(
-      "PDF tiles: display z≈",
-      zDisplay,
-      "maxNativeZoom",
-      maxNativeZoom,
-      zoomFromTableUsed ? "(full z; scale table)" : "(− " + EXPORT_PDF_TILE_LEVELS_COARSER + " levels)",
-    );
-    console.groupEnd();
     const layer = L.tileLayer(url, {
+      bounds: bounds,
       minZoom,
       maxZoom,
       maxNativeZoom,
@@ -1295,58 +1144,22 @@
     });
 
     setExportStatus("Loading map tiles for PDF…");
-    pdfExportLog("waiting for tiles (max 60s)…");
     await new Promise(function (resolve) {
       waitForTileLayerReady(printMap, layer, resolve, 60000);
     });
 
-    /** Small extra delay so decoded images paint */
-    pdfExportLog("tile wait finished, brief paint delay…");
     await new Promise(function (r) {
       setTimeout(r, 250);
     });
-    pdfExportLog("starting rasterise → PDF");
 
     const captureMaxEdge = Math.max(outerW, outerH, 1);
     const h2cScale = Math.min(
       EXPORT_HTML2CANVAS_SCALE_MAX,
       EXPORT_CAPTURE_MAX_EDGE_PX / captureMaxEdge,
     );
-    const layerAny = /** @type {any} */ (layer);
-    const tileZoomInternal = layerAny._tileZoom;
-    const domTiles = container.querySelectorAll("img.leaflet-tile");
-    /** @param {string} src */
-    function tileZFromUrl(src) {
-      const m = /\/(\d+)\/\d+\/\d+\.(?:png|jpe?g|webp)/i.exec(src);
-      return m ? Number(m[1]) : null;
-    }
-    const zs = [];
-    domTiles.forEach(function (img) {
-      const z = tileZFromUrl(img.src);
-      if (z !== null) zs.push(z);
-    });
-    console.groupCollapsed("[actomap PDF export] tiles loaded + rasterise");
-    console.log("layer._tileZoom (Leaflet grid)", tileZoomInternal);
-    console.log("map.getZoom()", printMap.getZoom());
-    console.log("DOM leaflet-tile count", domTiles.length);
-    if (zs.length) {
-      const zMin = Math.min.apply(null, zs);
-      const zMax = Math.max.apply(null, zs);
-      console.log("z from tile URLs (min … max)", zMin, "…", zMax, "(sample)", zs.slice(0, 6));
-      if (domTiles[0]) console.log("first tile src", domTiles[0].src);
-    } else {
-      console.warn("No tile URLs parsed — check network / CORS / tile template.");
-    }
-    console.log("html2canvas", {
-      captureMaxEdge: captureMaxEdge,
-      h2cScale: h2cScale,
-      expectedBitmapApprox: { w: Math.round(outerW * h2cScale), h: Math.round(outerH * h2cScale) },
-    });
-    console.groupEnd();
 
     const winW = Math.ceil(outerW);
     const winH = Math.ceil(outerH);
-    console.log("[actomap PDF export] raster", { doCrop: doCrop, winW: winW, winH: winH, h2cScale: h2cScale });
 
     let canvas;
     try {
@@ -1407,8 +1220,6 @@
       console.error(e);
       return;
     }
-    console.log("[actomap PDF export] canvas pixel size", canvas.width, canvas.height);
-
     /*
      * fitBounds keeps the whole LatLngBounds visible; Mercator vs container aspect often letterboxes,
      * so getBounds() is larger than `bounds` and the raster would show extra map (wrong 1:scale vs orange extent).
@@ -1431,13 +1242,6 @@
           if (ctxB) {
             ctxB.drawImage(canvas, sxB, syB, swB, shB, 0, 0, swB, shB);
             canvas = cBounds;
-            console.log("[actomap PDF export] cropped letterbox to export bounds", {
-              sx: sxB,
-              sy: syB,
-              sw: swB,
-              sh: shB,
-              aabbCss: aabb,
-            });
           }
         }
       }
@@ -1549,28 +1353,12 @@
       doneMsg += " — pdf-lib missing; PDF not georeferenced.";
     }
     if (zoomFromTableUsed) {
-      doneMsg +=
-        " — print zoom from scale table (1:" + scaleDen + " → z≈" + zFit.toFixed(2) + (tableZoomLiftedToFit ? "; raised to fill extent" : "") + ").";
+      doneMsg += " — z≈" + zFit.toFixed(2) + " (scale table 1:" + scaleDen + (tableZoomLiftedToFit ? ", raised to fit" : "") + ").";
+    } else {
+      doneMsg += " — z≈" + zFit.toFixed(1) + ", tiles z≤" + maxNativeZoom + ".";
     }
-    doneMsg +=
-      " — export zoom ≈ " +
-      zFit.toFixed(2) +
-      " (PDF tiles z≤" +
-      maxNativeZoom +
-      ", view z≈" +
-      zDisplay +
-      "; " +
-      fitPxScale +
-      "× map, capture " +
-      h2cScale.toFixed(2) +
-      ").";
     if (pdfRasterScaledForJsPdf) {
-      doneMsg +=
-        " — PDF image ≤" +
-        EXPORT_JSPDF_MAX_IMAGE_LONG_EDGE_PX +
-        "px edge (JPEG " +
-        Math.round(EXPORT_PDF_JPEG_QUALITY * 100) +
-        "%) for encoder limits.";
+      doneMsg += " — PDF raster ≤" + EXPORT_JSPDF_MAX_IMAGE_LONG_EDGE_PX + "px.";
     }
     setExportStatus(doneMsg);
   }
